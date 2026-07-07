@@ -17,6 +17,7 @@ from .pipeline_runner import (
     default_task_service,
 )
 from .quality_warnings import build_quality_warnings, merge_quality_warnings
+from .result_exporter import PipelineResultExporter
 from .result_store import TaskResultStore
 from .step_policy import DEFAULT_STEP_POLICIES, StepPolicy, resolve_step_policy
 from .step_runner import PipelineStepRunner
@@ -41,6 +42,7 @@ __all__ = [
     "default_task_service",
     "default_step_service",
     "default_result_store",
+    "PipelineResultExporter",
     "build_quality_warnings",
     "merge_quality_warnings",
     "StepPolicy",

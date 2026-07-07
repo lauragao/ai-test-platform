@@ -128,7 +128,7 @@ task = run_result["task"]
 
 ```bash
 python examples/run_ai_pipeline.py --file ../requirements/requirement.md --step all
-# 输出含 task_no、quality_warnings，并写入 tmp/tasks/
+# 结果写入 backend/tmp/outputs/{task_no}/，各阶段独立 JSON 文件
 ```
 
 ## REST API
@@ -144,12 +144,17 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | 健康检查 |
+| GET | `/api/models/routing` | 多模型路由配置与推荐策略 |
 | GET | `/api/tasks` | 任务列表（含 `should_warn_user`） |
 | GET | `/api/tasks/{task_no}` | 任务详情（含 `quality_warnings`） |
 | GET | `/api/tasks/{task_no}/quality-warnings` | 质量告警 |
 | GET | `/api/tasks/{task_no}/steps` | 步骤明细（timeout / retry / duration_ms） |
+| GET | `/api/tasks/{task_no}/document` | 解析后的文档章节（供三栏高亮） |
 | GET | `/api/tasks/{task_no}/report` | 分析报告（需求/问题/用例） |
-| POST | `/api/tasks/run` | 上传 `.md`/`.txt` 并异步执行流水线（202） |
+| POST | `/api/tasks/{task_no}/export?format=xlsx\|xmind` | 导出测试用例，返回下载链接 |
+| GET | `/api/tasks/{task_no}/exports/{filename}` | 下载导出文件 |
+| POST | `/api/tasks/{task_no}/retry` | 重试失败任务 |
+| POST | `/api/tasks/run` | 上传 `.md`/`.txt`/`.docx` 并异步执行流水线（202） |
 | POST | `/api/tasks/timeout-scan` | 扫描 running 步骤超时（cron/运维） |
 
 提交任务示例：
@@ -166,6 +171,10 @@ curl -X POST "http://localhost:8000/api/tasks/run" \
 curl "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6"
 curl "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6/quality-warnings"
 curl "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6/report"
+curl "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6/document"
+curl -X POST "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6/export?format=xlsx"
+curl -O "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6/exports/test_cases.xlsx"
+curl -X POST "http://localhost:8000/api/tasks/task_20260706182600_6de72ba6/retry"
 ```
 
 ## 导出 Excel / XMind
@@ -241,3 +250,38 @@ python examples/run_export_demo.py
 | `AI_TEMPERATURE` | 温度 | `0.2` |
 | `AI_MAX_RETRIES` | 校验失败重试次数 | `3` |
 | `AI_TIMEOUT_SECONDS` | 超时秒数 | `120` |
+| `AI_MULTI_MODEL_ENABLED` | 启用多模型路由 | `true` |
+| `AI_LONG_CONTEXT_THRESHOLD_CHARS` | 长文档切换阈值（字符） | `20000` |
+| `AI_MODEL_COMPLEX` | 复杂分析模型 | 回退 `AI_MODEL` |
+| `AI_MODEL_CASES` | 用例生成模型 | 回退 `AI_MODEL` |
+| `AI_MODEL_LIGHT` | 轻量任务模型 | 回退 `AI_MODEL` |
+| `AI_MODEL_LONG` | 长上下文模型 | 回退 `AI_MODEL` |
+
+各分类可独立配置 `AI_BASE_URL_*` / `AI_API_KEY_*`（见 `.env.example`）。
+
+## 多模型混合路由
+
+| 任务 | 自动选用 | 推荐配置 |
+|------|----------|----------|
+| 需求抽取 / 问题分析 | `complex_analysis` | GPT-4-turbo / Kimi |
+| 测试用例生成 | `case_generation` | GPT-4o / 智谱 GLM-4 |
+| 完备性自检 | `format_light` | GPT-3.5-turbo |
+| 大文档抽取（≥20k 字符） | `long_context` | Kimi 32k / 通义千问 |
+
+```bash
+curl http://localhost:8000/api/models/routing
+```
+
+关闭多模型（全程使用 `AI_MODEL`）：`AI_MULTI_MODEL_ENABLED=false`
+
+## 前端 Web（MVP）
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+浏览器访问 http://localhost:5173（需先启动后端 `uvicorn`，见上文 REST API）。
+
+详见 [frontend/README.md](../frontend/README.md)。

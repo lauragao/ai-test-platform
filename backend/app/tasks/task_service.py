@@ -114,6 +114,20 @@ class TaskService:
         task.finished_at = datetime.now()
         return self.save(task)
 
+    def reset_for_retry(self, task: TaskRecord) -> TaskRecord:
+        """重置失败任务，准备重新执行流水线。"""
+        now = datetime.now()
+        task.status = TaskStatus.UPLOADED.value
+        task.progress = 5
+        task.current_step = "upload"
+        task.step_message = "任务重试中，等待分析"
+        task.error_code = None
+        task.error_message = None
+        task.finished_at = None
+        task.quality_warnings = None
+        task.started_at = now
+        return self.save(task)
+
     def list_tasks(self, limit: int = 20) -> list[TaskRecord]:
         tasks: list[TaskRecord] = []
         for path in sorted(

@@ -10,6 +10,8 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.ai.llm_client import LlmClient
+from app.ai.model_profiles import ModelProfile
+from app.ai.model_router import ModelRouter, estimate_sections_char_count
 from app.ai.models import (
     AiRunRecord,
     AnalyzeRequirementsResult,
@@ -74,6 +76,7 @@ class AiService:
     ):
         self.settings = settings or get_settings()
         self.client = LlmClient(self.settings)
+        self.model_router = ModelRouter(self.settings)
         self.on_run_complete = on_run_complete
 
     def extract_requirements(
@@ -95,6 +98,7 @@ class AiService:
             user_prompt=user,
             schema_validator=None,
             input_summary=f"sections={len(sections)}",
+            input_char_count=estimate_sections_char_count(sections),
             task_id=task_id,
             task_step_id=task_step_id,
         )
@@ -123,6 +127,7 @@ class AiService:
             input_summary=(
                 f"sections={len(sections)}, requirements={len(requirements)}"
             ),
+            input_char_count=estimate_sections_char_count(sections),
             task_id=task_id,
             task_step_id=task_step_id,
         )
@@ -148,6 +153,7 @@ class AiService:
             user_prompt=user,
             schema_validator=validate_issues_schema,
             input_summary=f"sections={len(sections)}, requirements={len(requirements)}",
+            input_char_count=estimate_sections_char_count(sections),
             task_id=task_id,
             task_step_id=task_step_id,
         )
@@ -175,6 +181,7 @@ class AiService:
             user_prompt=user,
             schema_validator=validate_cases_schema,
             input_summary=f"requirements={len(requirements)}, issues={len(issues)}",
+            input_char_count=len(items_to_json(requirements)) + len(items_to_json(issues)),
             task_id=task_id,
             task_step_id=task_step_id,
         )
@@ -255,7 +262,12 @@ class AiService:
         input_summary: str,
         task_id: Optional[int],
         task_step_id: Optional[int],
+        input_char_count: int = 0,
     ) -> T:
+        profile = self.model_router.resolve(run_type, input_char_count=input_char_count)
+        enriched_summary = (
+            f"{input_summary} | model_category={profile.category.value} | model={profile.model}"
+        )
         last_error: Optional[str] = None
         last_raw: Optional[str] = None
 
@@ -266,7 +278,11 @@ class AiService:
             error_message: Optional[str] = None
 
             try:
-                llm_resp = self.client.chat_json(system_prompt, user_prompt)
+                llm_resp = self.client.chat_json(
+                    system_prompt,
+                    user_prompt,
+                    profile=profile,
+                )
                 last_raw = llm_resp.content
                 parsed = parse_json_content(llm_resp.content)
 
@@ -281,8 +297,9 @@ class AiService:
                     task_step_id=task_step_id,
                     run_type=run_type,
                     prompt_version=prompt_version,
-                    input_summary=input_summary,
+                    input_summary=enriched_summary,
                     llm_resp=llm_resp,
+                    profile=profile,
                     status="success",
                     output_raw=last_raw,
                     output_parsed=parsed,
@@ -310,8 +327,9 @@ class AiService:
                         task_step_id=task_step_id,
                         run_type=run_type,
                         prompt_version=prompt_version,
-                        input_summary=input_summary,
+                        input_summary=enriched_summary,
                         llm_resp=llm_resp,
+                        profile=profile,
                         status="failed",
                         output_raw=last_raw,
                         output_parsed=parsed,
@@ -330,8 +348,9 @@ class AiService:
                     task_step_id=task_step_id,
                     run_type=run_type,
                     prompt_version=prompt_version,
-                    input_summary=input_summary,
+                    input_summary=enriched_summary,
                     llm_resp=llm_resp,
+                    profile=profile,
                     status="failed",
                     output_raw=last_raw,
                     error_message=error_message,
@@ -347,8 +366,9 @@ class AiService:
                     task_step_id=task_step_id,
                     run_type=run_type,
                     prompt_version=prompt_version,
-                    input_summary=input_summary,
+                    input_summary=enriched_summary,
                     llm_resp=llm_resp,
+                    profile=profile,
                     status="failed",
                     output_raw=last_raw,
                     error_message=str(exc),
@@ -366,6 +386,7 @@ class AiService:
         prompt_version: str,
         input_summary: str,
         llm_resp,
+        profile: ModelProfile,
         status: str,
         output_raw: Optional[str] = None,
         output_parsed: Optional[dict] = None,
@@ -379,7 +400,8 @@ class AiService:
             task_id=task_id,
             task_step_id=task_step_id,
             run_type=run_type,
-            model_name=llm_resp.model if llm_resp else self.settings.ai_model,
+            model_name=llm_resp.model if llm_resp else profile.model,
+            model_version=profile.category.value,
             prompt_version=prompt_version,
             input_tokens=llm_resp.input_tokens if llm_resp else None,
             output_tokens=llm_resp.output_tokens if llm_resp else None,

@@ -92,6 +92,39 @@ class TaskReportResponse(BaseModel):
     cases: dict[str, Any]
 
 
+class DocumentSectionResponse(BaseModel):
+    section_id: str
+    title: Optional[str] = None
+    level: int = 1
+    content: str
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    source_snapshot: Optional[dict[str, Any]] = None
+    parse_confidence: Optional[float] = None
+
+
+class TaskDocumentResponse(BaseModel):
+    task_no: str
+    source_file: Optional[str] = None
+    section_count: int
+    document_parse_confidence: Optional[float] = None
+    sections: list[DocumentSectionResponse]
+
+
+class ExportTaskResponse(BaseModel):
+    task_no: str
+    format: str
+    filename: str
+    download_url: str
+    file_size: int
+
+
+class RetryTaskResponse(BaseModel):
+    task_no: str
+    status: str
+    message: str
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     service: str = "nb-test-platform-api"

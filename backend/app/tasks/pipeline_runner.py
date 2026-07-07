@@ -192,15 +192,28 @@ class PipelineTaskRunner:
                 "parse_quality": parse_quality,
                 "cases": cases_result,
             }
-            payload = self._build_result_payload(task, pipeline_result, case_report)
+            output_dir: Path | None = None
             if self.result_store:
-                self.result_store.save(task.task_no, payload)
+                output_dir = self.result_store.save_pipeline(
+                    task.task_no,
+                    task_status=task.status,
+                    source_file=task.source_file,
+                    extract=extract_result,
+                    analyze=analyze_result,
+                    requirements=requirements,
+                    parse_quality=parse_quality,
+                    case_quality=case_report,
+                    cases=cases_result,
+                    completeness=completeness_result,
+                    quality_warnings=task.quality_warnings,
+                )
 
             return {
                 "task": task,
                 "pipeline": pipeline_result,
                 "case_quality": case_report,
                 "quality_warnings": quality_warnings,
+                "output_dir": output_dir,
             }
         except Exception as exc:
             if task.status != TaskStatus.FAILED.value:
@@ -210,26 +223,6 @@ class PipelineTaskRunner:
                     error_message=str(exc),
                 )
             raise
-
-    @staticmethod
-    def _build_result_payload(task: TaskRecord, result: dict[str, Any], case_report) -> dict[str, Any]:
-        pipeline = result
-        return {
-            "task_no": task.task_no,
-            "task_status": task.status,
-            "quality_warnings": task.quality_warnings.model_dump(mode="json")
-            if task.quality_warnings
-            else None,
-            "extract": pipeline["extract"].model_dump(),
-            "completeness": pipeline["completeness"].model_dump()
-            if pipeline.get("completeness")
-            else None,
-            "requirements": [item.model_dump() for item in pipeline["requirements"]],
-            "analyze": pipeline["analyze"].model_dump(),
-            "parse_quality": pipeline["parse_quality"].model_dump(),
-            "case_quality": case_report.model_dump(),
-            "cases": pipeline["cases"].model_dump(),
-        }
 
 
 def default_task_service(backend_root: Path | None = None) -> TaskService:
@@ -244,4 +237,4 @@ def default_step_service(backend_root: Path | None = None) -> TaskStepService:
 
 def default_result_store(backend_root: Path | None = None) -> TaskResultStore:
     root = backend_root or Path(__file__).resolve().parents[2]
-    return TaskResultStore(root / "tmp" / "results")
+    return TaskResultStore(root / "tmp" / "outputs")

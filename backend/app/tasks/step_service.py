@@ -94,6 +94,11 @@ class TaskStepService:
             status=TaskStepStatus.TIMEOUT.value,
         )
 
+    def reset_steps(self, task_no: str) -> None:
+        path = self._path(task_no)
+        if path.exists():
+            path.unlink()
+
     def _update_step(
         self,
         task_no: str,
