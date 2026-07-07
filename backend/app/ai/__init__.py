@@ -3,12 +3,14 @@
 from .ai_service import AiService, AiServiceError
 from .models import (
     AnalyzeRequirementsResult,
+    CompletenessCheckResult,
     DocumentSectionInput,
     ExtractRequirementsResult,
     GenerateTestCasesResult,
     RequirementIssue,
     RequirementItem,
     RunType,
+    SectionCoverageItem,
     TestCaseItem,
 )
 
@@ -21,6 +23,8 @@ __all__ = [
     "RequirementIssue",
     "TestCaseItem",
     "ExtractRequirementsResult",
+    "CompletenessCheckResult",
+    "SectionCoverageItem",
     "AnalyzeRequirementsResult",
     "GenerateTestCasesResult",
 ]

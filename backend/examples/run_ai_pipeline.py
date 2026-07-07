@@ -12,7 +12,6 @@ AiService 使用示例。
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -22,53 +21,10 @@ sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.ai import AiService, DocumentSectionInput  # noqa: E402
 from app.ai.models import AiRunRecord  # noqa: E402
-
-
-def parse_markdown_sections(content: str) -> list[DocumentSectionInput]:
-    """将 Markdown 按标题切分为章节（MVP 简易解析）。"""
-    sections: list[DocumentSectionInput] = []
-    current_title: str | None = None
-    current_level = 1
-    current_lines: list[str] = []
-    sec_idx = 0
-
-    def flush():
-        nonlocal sec_idx
-        text = "\n".join(current_lines).strip()
-        if not text and not current_title:
-            return
-        sec_idx += 1
-        sections.append(
-            DocumentSectionInput(
-                section_id=f"sec_{sec_idx:03d}",
-                title=current_title,
-                level=current_level,
-                content=text or (current_title or ""),
-            )
-        )
-
-    for line in content.splitlines():
-        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if heading:
-            flush()
-            current_level = len(heading.group(1))
-            current_title = heading.group(2).strip()
-            current_lines = []
-        else:
-            current_lines.append(line)
-
-    flush()
-
-    if not sections:
-        sections.append(
-            DocumentSectionInput(
-                section_id="sec_001",
-                title="全文",
-                level=1,
-                content=content.strip(),
-            )
-        )
-    return sections
+from app.document.enrich import enrich_sections_with_snapshot  # noqa: E402
+from app.document.markdown_parser import parse_markdown_sections  # noqa: E402
+from app.tasks import PipelineTaskRunner, default_task_service  # noqa: E402
+from app.tasks.pipeline_runner import default_result_store  # noqa: E402
 
 
 def on_run_complete(record: AiRunRecord) -> None:
@@ -84,10 +40,11 @@ def main():
     parser.add_argument("--file", required=True, help="需求文档路径（.md / .txt）")
     parser.add_argument(
         "--step",
-        choices=["all", "extract", "analyze", "cases"],
+        choices=["all", "extract", "completeness", "analyze", "cases"],
         default="all",
         help="执行步骤，默认全流程",
     )
+    parser.add_argument("--title", default=None, help="文档标题（完备性自检时使用）")
     args = parser.parse_args()
 
     file_path = Path(args.file)
@@ -96,28 +53,77 @@ def main():
         sys.exit(1)
 
     content = file_path.read_text(encoding="utf-8")
-    sections = parse_markdown_sections(content)
+    sections = enrich_sections_with_snapshot(parse_markdown_sections(content))
     print(f"已解析 {len(sections)} 个章节，开始 AI 处理...\n")
 
     service = AiService(on_run_complete=on_run_complete)
 
     if args.step == "all":
-        result = service.run_full_pipeline(sections)
+        task_service = default_task_service(BACKEND_ROOT)
+        runner = PipelineTaskRunner(
+            AiService(on_run_complete=on_run_complete),
+            task_service,
+            default_result_store(BACKEND_ROOT),
+        )
+        run_result = runner.run_full(
+            sections,
+            source_file=str(file_path),
+            document_title=args.title,
+            source_type=file_path.suffix.lstrip(".") or "unknown",
+        )
+        result = run_result["pipeline"]
+        task = run_result["task"]
         output = {
+            "task_no": task.task_no,
+            "task_status": task.status,
+            "quality_warnings": task.quality_warnings.model_dump(mode="json")
+            if task.quality_warnings
+            else None,
             "extract": result["extract"].model_dump(),
+            "completeness": result["completeness"].model_dump()
+            if result["completeness"]
+            else None,
+            "requirements": [r.model_dump() for r in result["requirements"]],
             "analyze": result["analyze"].model_dump(),
+            "parse_quality": result["parse_quality"].model_dump(),
+            "case_quality": run_result["case_quality"].model_dump(),
             "cases": result["cases"].model_dump(),
         }
+        if task.quality_warnings and task.quality_warnings.should_warn_user:
+            print(f"\n⚠ 任务 {task.task_no} 质量告警（已写入 quality_warnings）：")
+            for item in task.quality_warnings.items:
+                print(f"  - [{item.level}] {item.message}")
+        print(f"\n任务记录已保存: {BACKEND_ROOT / 'tmp' / 'tasks' / (task.task_no + '.json')}")
     elif args.step == "extract":
         output = service.extract_requirements(sections).model_dump()
+    elif args.step == "completeness":
+        extract = service.extract_requirements(sections)
+        output = service.check_requirement_completeness(
+            sections,
+            extract.requirements,
+            document_title=args.title,
+        ).model_dump()
     elif args.step == "analyze":
         extract = service.extract_requirements(sections)
-        output = service.analyze_requirements(sections, extract.requirements).model_dump()
+        completeness = service.check_requirement_completeness(
+            sections,
+            extract.requirements,
+            document_title=args.title,
+        )
+        from app.ai.utils import collect_refill_section_ids, merge_requirements
+
+        requirements = list(extract.requirements)
+        refill_ids = collect_refill_section_ids(completeness)
+        if refill_ids:
+            refill_sections = [s for s in sections if s.section_id in refill_ids]
+            if refill_sections:
+                refill = service.extract_requirements(refill_sections)
+                requirements = merge_requirements(requirements, refill.requirements)
+        output = service.analyze_requirements(sections, requirements).model_dump()
     else:
-        extract = service.extract_requirements(sections)
-        analyze = service.analyze_requirements(sections, extract.requirements)
+        result = service.run_full_pipeline(sections, document_title=args.title)
         output = service.generate_test_cases(
-            extract.requirements, analyze.issues
+            result["requirements"], result["analyze"].issues
         ).model_dump()
 
     out_path = BACKEND_ROOT / "tmp" / f"ai_result_{file_path.stem}.json"

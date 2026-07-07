@@ -5,6 +5,7 @@ import logging
 from typing import Callable, Optional, TypeVar
 
 import jsonschema
+from openai import APITimeoutError
 from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
@@ -12,6 +13,7 @@ from app.ai.llm_client import LlmClient
 from app.ai.models import (
     AiRunRecord,
     AnalyzeRequirementsResult,
+    CompletenessCheckResult,
     DocumentSectionInput,
     ExtractRequirementsResult,
     GenerateTestCasesResult,
@@ -22,15 +24,22 @@ from app.ai.models import (
 from app.ai.prompts import (
     case_generation,
     requirement_analysis,
+    requirement_completeness_check,
     requirement_extract,
 )
 from app.ai.rules import get_case_generation_rules
+from app.document.enrich import enrich_sections_with_snapshot
 from app.ai.utils import (
+    build_document_toc,
     build_retry_prompt,
+    collect_refill_section_ids,
     items_to_json,
+    merge_requirements,
     parse_json_content,
+    requirements_to_summary_json,
     sections_to_json,
     validate_cases_schema,
+    validate_completeness_schema,
     validate_issues_schema,
 )
 
@@ -42,15 +51,20 @@ T = TypeVar("T", bound=BaseModel)
 class AiServiceError(Exception):
     """AI 调用或结果校验失败。"""
 
+    def __init__(self, message: str, *, error_code: str = "pipeline_failed"):
+        super().__init__(message)
+        self.error_code = error_code
+
 
 class AiService:
     """
     统一 AI 编排服务。
 
-    提供 3 个核心能力：
-    1. extract_requirements  - 需求摘要 + 原子需求拆分
-    2. analyze_requirements  - 需求问题分析（不清晰/遗漏/矛盾/风险）
-    3. generate_test_cases   - 测试用例生成
+    提供 4 个核心能力：
+    1. extract_requirements           - 需求摘要 + 原子需求拆分
+    2. check_requirement_completeness - 需求点完备性自检（反思）
+    3. analyze_requirements           - 需求问题分析（不清晰/遗漏/矛盾/风险）
+    4. generate_test_cases            - 测试用例生成
     """
 
     def __init__(
@@ -81,6 +95,34 @@ class AiService:
             user_prompt=user,
             schema_validator=None,
             input_summary=f"sections={len(sections)}",
+            task_id=task_id,
+            task_step_id=task_step_id,
+        )
+
+    def check_requirement_completeness(
+        self,
+        sections: list[DocumentSectionInput],
+        requirements: list[RequirementItem],
+        *,
+        document_title: Optional[str] = None,
+        task_id: Optional[int] = None,
+        task_step_id: Optional[int] = None,
+    ) -> CompletenessCheckResult:
+        """对照文档目录审视需求点覆盖是否完整（反思步骤）。"""
+        system, user = requirement_completeness_check.build_messages(
+            build_document_toc(sections, document_title),
+            requirements_to_summary_json(requirements),
+        )
+        return self._run(
+            run_type=RunType.CHECK_REQUIREMENT_COMPLETENESS,
+            prompt_version=requirement_completeness_check.VERSION,
+            result_model=CompletenessCheckResult,
+            system_prompt=system,
+            user_prompt=user,
+            schema_validator=validate_completeness_schema,
+            input_summary=(
+                f"sections={len(sections)}, requirements={len(requirements)}"
+            ),
             task_id=task_id,
             task_step_id=task_step_id,
         )
@@ -141,23 +183,63 @@ class AiService:
         self,
         sections: list[DocumentSectionInput],
         *,
+        document_title: Optional[str] = None,
+        source_type: Optional[str] = None,
         task_id: Optional[int] = None,
+        max_completeness_rounds: int = 2,
     ) -> dict:
-        """串联执行：抽取需求 → 分析问题 → 生成用例。"""
+        """串联执行：抽取需求 → 完备性自检（含定向补抽）→ 分析问题 → 解析质量告警 → 生成用例。"""
+        sections = enrich_sections_with_snapshot(sections)
         extract_result = self.extract_requirements(sections, task_id=task_id)
+        requirements = list(extract_result.requirements)
+        completeness_result: Optional[CompletenessCheckResult] = None
+
+        for _ in range(max_completeness_rounds):
+            completeness_result = self.check_requirement_completeness(
+                sections,
+                requirements,
+                document_title=document_title,
+                task_id=task_id,
+            )
+            refill_ids = collect_refill_section_ids(completeness_result)
+            if not refill_ids:
+                break
+
+            refill_sections = [
+                section for section in sections if section.section_id in refill_ids
+            ]
+            if not refill_sections:
+                break
+
+            refill_result = self.extract_requirements(
+                refill_sections,
+                task_id=task_id,
+            )
+            requirements = merge_requirements(requirements, refill_result.requirements)
+
         analyze_result = self.analyze_requirements(
             sections,
-            extract_result.requirements,
+            requirements,
             task_id=task_id,
         )
+        from app.quality.parse_quality_service import ParseQualityService
+
+        parse_quality = ParseQualityService().check_after_analysis(
+            sections,
+            analyze_result.issues,
+            source_type=source_type,
+        )
         cases_result = self.generate_test_cases(
-            extract_result.requirements,
+            requirements,
             analyze_result.issues,
             task_id=task_id,
         )
         return {
             "extract": extract_result,
+            "completeness": completeness_result,
+            "requirements": requirements,
             "analyze": analyze_result,
+            "parse_quality": parse_quality,
             "cases": cases_result,
         }
 
@@ -237,8 +319,27 @@ class AiService:
                         error_message=error_message,
                     )
                     raise AiServiceError(
-                        f"AI 调用失败 [{run_type.value}]，已重试 {self.settings.ai_max_retries} 次: {error_message}"
+                        f"AI 调用失败 [{run_type.value}]，已重试 {self.settings.ai_max_retries} 次: {error_message}",
+                        error_code="validation_failed",
                     ) from exc
+
+            except APITimeoutError as exc:
+                error_message = str(exc)
+                self._emit_run_record(
+                    task_id=task_id,
+                    task_step_id=task_step_id,
+                    run_type=run_type,
+                    prompt_version=prompt_version,
+                    input_summary=input_summary,
+                    llm_resp=llm_resp,
+                    status="failed",
+                    output_raw=last_raw,
+                    error_message=error_message,
+                )
+                raise AiServiceError(
+                    f"AI 调用超时 [{run_type.value}]（>{self.settings.ai_timeout_seconds}s）: {error_message}",
+                    error_code="ai_call_timeout",
+                ) from exc
 
             except Exception as exc:
                 self._emit_run_record(

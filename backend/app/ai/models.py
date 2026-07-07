@@ -5,9 +5,12 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from app.document.section_snapshot import SourceSnapshot
+
 
 class RunType(str, Enum):
     EXTRACT_REQUIREMENTS = "extract_requirements"
+    CHECK_REQUIREMENT_COMPLETENESS = "check_requirement_completeness"
     ANALYZE_REQUIREMENTS = "analyze_requirements"
     GENERATE_CASES = "generate_cases"
 
@@ -21,6 +24,14 @@ class DocumentSectionInput(BaseModel):
     content: str
     page_start: Optional[int] = None
     page_end: Optional[int] = None
+    source_snapshot: Optional[SourceSnapshot] = Field(
+        default=None,
+        description="原文快照：字符长度、空白比、表格/特殊字符密度等",
+    )
+    parse_confidence: Optional[float] = Field(
+        default=None,
+        description="本段解析置信度 0~1，由 source_snapshot 启发式计算",
+    )
 
 
 class RequirementItem(BaseModel):
@@ -82,6 +93,33 @@ class TestCaseItem(BaseModel):
 class ExtractRequirementsResult(BaseModel):
     summary: str
     requirements: list[RequirementItem]
+
+
+class SectionCoverageItem(BaseModel):
+    """单个章节的覆盖映射。"""
+
+    section_id: str
+    section_title: Optional[str] = None
+    coverage_status: str = Field(description="covered | partial | missing")
+    requirement_count: int = 0
+    linked_req_keys: list[str] = Field(default_factory=list)
+    gap_reason: Optional[str] = None
+
+
+class RefillSection(BaseModel):
+    """需定向补抽的章节。"""
+
+    section_id: str
+    reason: str
+
+
+class CompletenessCheckResult(BaseModel):
+    """需求点完备性自检结果。"""
+
+    summary: str
+    coverage_map: list[SectionCoverageItem]
+    sections_to_refill: list[RefillSection] = Field(default_factory=list)
+    overall_coverage_rate: Optional[float] = None
 
 
 class AnalyzeRequirementsResult(BaseModel):

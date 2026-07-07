@@ -101,7 +101,8 @@ nb_test_requirement_issues / nb_test_test_cases / nb_test_ai_runs 1 ── N nb_
 | end_offset | INT | N | 全文字符结束偏移 |
 | tables | JSON | N | 表格结构化数据 |
 | images | JSON | N | 图片信息（路径、OCR 文本、置信度） |
-| parse_confidence | DECIMAL(5,2) | N | 本段解析置信度 |
+| source_snapshot | JSON | N | 原文快照：字符长度、空白比、表格/特殊字符密度等 |
+| parse_confidence | DECIMAL(5,2) | N | 本段解析置信度（0~1，由 source_snapshot 启发式计算） |
 | parse_warnings | JSON | N | 解析异常，如表格解析失败 |
 | created_at | DATETIME | Y | 创建时间 |
 | updated_at | DATETIME | Y | 更新时间 |
@@ -110,6 +111,24 @@ nb_test_requirement_issues / nb_test_test_cases / nb_test_ai_runs 1 ── N nb_
 - `idx_nb_test_sections_document_id`
 - `idx_nb_test_sections_parent_id`
 - `idx_nb_test_sections_document_sort`（document_id + sort_order）
+
+**`source_snapshot` JSON 示例：**
+
+```json
+{
+  "raw_char_length": 120,
+  "whitespace_count": 10,
+  "whitespace_ratio": 0.0833,
+  "table_marker_count": 0,
+  "table_marker_density": 0.0,
+  "special_char_count": 2,
+  "special_char_density": 1.67,
+  "alphanumeric_count": 45,
+  "alphanumeric_ratio": 0.375,
+  "cjk_count": 58,
+  "line_count": 3
+}
+```
 
 ---
 
@@ -131,7 +150,9 @@ nb_test_requirement_issues / nb_test_test_cases / nb_test_ai_runs 1 ── N nb_
 | error_message | TEXT | N | 错误详情 |
 | retry_count | INT | Y | 已重试次数，默认 0 |
 | max_retry | INT | Y | 最大重试次数，默认 3 |
-| config | JSON | N | 任务配置（分析类型、导出格式、模型选择等） |
+| timeout_seconds | INT | Y | 任务级默认步骤超时（秒），默认 180 |
+| config | JSON | N | 任务配置（分析类型、导出格式、模型选择、各步骤 timeout 覆盖等） |
+| quality_warnings | JSON | N | 质量告警（解析置信度、inferred 占比、引用错乱、用例覆盖率等，见下方示例） |
 | started_at | DATETIME | N | 开始执行时间 |
 | finished_at | DATETIME | N | 结束时间 |
 | created_at | DATETIME | Y | 创建时间 |
@@ -141,11 +162,44 @@ nb_test_requirement_issues / nb_test_test_cases / nb_test_ai_runs 1 ── N nb_
 `created` → `uploaded` → `parsing` → `parsed` → `analyzing` → `analysis_completed` → `generating_cases` → `case_completed` → `exporting` → `completed`  
 异常态：`failed` / `cancelled`
 
+**`failed` 常见 `error_code`：** `step_timeout` / `ai_call_timeout` / `max_retries_exceeded` / `pipeline_failed`
+
 **索引：**
 - `idx_nb_test_tasks_document_id`
 - `idx_nb_test_tasks_status`
 - `idx_nb_test_tasks_task_no`（UNIQUE）
 - `idx_nb_test_tasks_created_at`
+
+**`quality_warnings` JSON 示例：**
+
+```json
+{
+  "items": [
+    {
+      "warning_type": "parse_quality",
+      "level": "warning",
+      "message": "文档解析置信度低于阈值，可能影响分析质量，建议检查 PDF 是否为扫描件或版式是否复杂。",
+      "metrics": {
+        "document_parse_confidence": 0.52,
+        "inferred_issue_ratio": 0.48,
+        "broken_citation_ratio": 0.25
+      }
+    },
+    {
+      "warning_type": "case_coverage",
+      "level": "warning",
+      "message": "需求覆盖率 88.0% 低于目标 95.0%",
+      "metrics": {
+        "coverage_rate": 88.0,
+        "orphan_case_count": 2
+      }
+    }
+  ],
+  "alert_level": "warning",
+  "should_warn_user": true,
+  "updated_at": "2026-07-06T18:00:00"
+}
+```
 
 ---
 
@@ -159,10 +213,14 @@ nb_test_requirement_issues / nb_test_test_cases / nb_test_ai_runs 1 ── N nb_
 | task_id | BIGINT | FK | 关联 `nb_test_tasks.id` |
 | step_name | VARCHAR(64) | Y | 步骤名：`parse` / `clean` / `chunk` / `extract_requirements` / `check_issues` / `generate_cases` / `validate` / `export` |
 | step_order | INT | Y | 步骤顺序 |
-| status | VARCHAR(32) | Y | `pending` / `running` / `success` / `failed` / `skipped` |
+| status | VARCHAR(32) | Y | `pending` / `running` / `success` / `failed` / `skipped` / `timeout` |
 | input_snapshot | JSON | N | 输入摘要（非全文，便于排查） |
 | output_snapshot | JSON | N | 输出摘要或结果 ID 列表 |
+| error_code | VARCHAR(64) | N | 如 `step_timeout` / `ai_call_timeout` / `validation_failed` |
 | error_message | TEXT | N | 失败原因 |
+| retry_count | INT | Y | 本步骤已重试次数，默认 0 |
+| max_retry | INT | Y | 本步骤最大重试次数，默认 3 |
+| timeout_seconds | INT | Y | 本步骤超时（秒），超时后标记 failed 并触发重试或任务 failed |
 | started_at | DATETIME | N | 开始时间 |
 | finished_at | DATETIME | N | 结束时间 |
 | duration_ms | INT | N | 耗时（毫秒） |
@@ -497,7 +555,9 @@ CREATE TABLE nb_test_tasks (
   error_message   TEXT,
   retry_count     INT NOT NULL DEFAULT 0,
   max_retry       INT NOT NULL DEFAULT 3,
+  timeout_seconds INT NOT NULL DEFAULT 180,
   config          JSON,
+  quality_warnings JSON,
   started_at      DATETIME,
   finished_at     DATETIME,
   created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
